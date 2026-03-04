@@ -1,295 +1,235 @@
-"""
-server.py - FastMCP + YOLO11 inference MCP server (B안 강화판)
-
-✅ 목적
-- Agent Builder가 GPT 비전으로 "추정"하지 못하게, MCP(YOLO) 결과를
-  다음 에이전트/워크플로우가 그대로 파싱 가능한 JSON으로 반환
-- tool 호출 여부를 서버 로그로 즉시 확인 가능
-- 결과 변조/재서술 여부를 감지할 수 있도록 source/nonce 포함
-
-✅ 설치(권장: 서버/컨테이너)
-  pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless
-  pip install --no-cache-dir opencv-python-headless ultralytics fastmcp requests
-
-(필요 시, Ubuntu/Debian)
-  sudo apt-get update
-  sudo apt-get install -y libgl1 libglib2.0-0
-
-✅ 환경변수
-- WEIGHTS=./best.pt
-- DEVICE=cpu   (GPU면 "0")
-- PORT=8001
-- CONF=0.25
-- IOU=0.45
-
-✅ 반환(JSON-only)
-{
-  "source": "yolo11_mcp",
-  "nonce": "<uuid>",
-  "weights": "<abs path>",
-  "device": "cpu|0",
-  "top_species": str|null,
-  "top_confidence": float|null,
-  "species_counts": { "<species>": int, ... },
-  "detections": [
-    { "species": str, "confidence": float, "bbox_xyxy":[x1,y1,x2,y2] }, ...
-  ],
-  "error": str? (있을 수도 있음)
-}
-"""
-
-from __future__ import annotations
-
-import os
-import uuid
 import base64
-import tempfile
-from typing import Any, Dict, Optional
+import io
+import json
+import os
+from typing import Any, Dict, Optional, List, Tuple
 
-import requests
-from fastmcp import FastMCP
+import numpy as np
+from PIL import Image
 
+from ultralytics import YOLO
 
-# --------------------------------------------
-# ✅ 부트 진단: cv2 / ultralytics import 문제를 빨리 잡기
-# --------------------------------------------
-def _boot_diagnostics() -> None:
-    pyver = f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}"
-    print(f"[BOOT] Python: {pyver}")
-    print(f"[BOOT] WEIGHTS={os.getenv('WEIGHTS', '(default)')}, DEVICE={os.getenv('DEVICE', 'cpu')}")
-
-    try:
-        import cv2  # noqa: F401
-        print("[BOOT] cv2 import: OK")
-    except Exception as e:
-        print("[BOOT] cv2 import: FAIL")
-        print(f"[BOOT] cv2 error: {repr(e)}")
-        raise
-
-    try:
-        from ultralytics import YOLO  # noqa: F401
-        print("[BOOT] ultralytics import: OK")
-    except Exception as e:
-        print("[BOOT] ultralytics import: FAIL")
-        print(f"[BOOT] ultralytics error: {repr(e)}")
-        raise
+from mcp.server.fastmcp import FastMCP
 
 
-_boot_diagnostics()
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "best.pt")
+SPECIES_MAP_PATH = os.getenv("SPECIES_MAP_PATH", "species_map.json")
 
-# --------------------------------------------
-# ✅ YOLO 로드 (서버 시작 시 1회)
-# --------------------------------------------
-from ultralytics import YOLO  # noqa: E402
-
-mcp = FastMCP("YOLO11 MCP Server")
-
-WEIGHTS_PATH = os.getenv("WEIGHTS", "./best.pt")
-DEVICE = os.getenv("DEVICE", "cpu")  # "cpu" 또는 "0"(GPU)
-
-CONF_DEFAULT = float(os.getenv("CONF", "0.25"))
-IOU_DEFAULT = float(os.getenv("IOU", "0.45"))
-
-WEIGHTS_ABS = os.path.abspath(WEIGHTS_PATH)
-
-print(f"[BOOT] Loading YOLO weights: {WEIGHTS_PATH}")
-print(f"[BOOT] WEIGHTS abs: {WEIGHTS_ABS}")
-model = YOLO(WEIGHTS_PATH)
-print("[BOOT] Model loaded: OK")
+# confidence threshold (필요시 환경변수로 조정)
+CONF_THRES = float(os.getenv("YOLO_CONF_THRES", "0.25"))
+IOU_THRES = float(os.getenv("YOLO_IOU_THRES", "0.45"))
 
 
-# --------------------------------------------
-# ✅ class_id -> 종명 (사용자 제공 매핑)
-# --------------------------------------------
-SPECIES_MAP = {
-    0: "Chelydra serpentina",
-    1: "Macrochelys temminckii",
-    2: "Mauremys sinensis",
-    3: "Pseudemys concinna",
-    4: "Pseudemys nelsoni",
-    5: "Trachemys scripta",
-}
+def _load_species_map(path: str) -> Dict[str, Dict[str, str]]:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-# --------------------------------------------
-# 유틸: 입력(base64/URL) -> 임시 파일 저장
-# --------------------------------------------
-def _save_base64_to_tempfile(image_b64: str, suffix: str = ".jpg") -> str:
-    # "data:image/jpeg;base64,..." 형태도 처리
-    if "," in image_b64:
-        image_b64 = image_b64.split(",", 1)[1]
-
-    img_bytes = base64.b64decode(image_b64)
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f:
-        f.write(img_bytes)
-    return path
+SPECIES_MAP = _load_species_map(SPECIES_MAP_PATH)
 
 
-def _download_url_to_tempfile(url: str, timeout: int = 25, suffix: str = ".jpg") -> str:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f:
-        f.write(r.content)
-    return path
+def _pil_from_base64(b64_str: str) -> Image.Image:
+    raw = base64.b64decode(b64_str)
+    return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
-# --------------------------------------------
-# ✅ Ultralytics 결과 -> "다음 에이전트가 바로 소비" 가능한 JSON
-# --------------------------------------------
-def _results_to_json(results) -> Dict[str, Any]:
-    """
-    JSON-only response for downstream agent/workflow.
-    Includes 'source' and 'nonce' to detect non-tool answers or transformations.
-    """
-    out: Dict[str, Any] = {
-        "source": "yolo11_mcp",
-        "nonce": str(uuid.uuid4()),
-        "weights": WEIGHTS_ABS,
-        "device": DEVICE,
-        "top_species": None,
-        "top_confidence": None,
-        "species_counts": {},
-        "detections": [],
+def _pil_from_path(path: str) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def _pil_from_url(url: str) -> Image.Image:
+    # requests를 requirements에 추가하지 않아도 되게, urllib 사용
+    import urllib.request
+
+    with urllib.request.urlopen(url) as resp:
+        data = resp.read()
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _image_to_numpy_rgb(img: Image.Image) -> np.ndarray:
+    # ultralytics는 PIL도 받지만, 일관성 위해 numpy RGB로 통일
+    return np.array(img)
+
+
+def _xyxy_to_list(xyxy: np.ndarray) -> List[float]:
+    return [float(x) for x in xyxy.tolist()]
+
+
+def _class_name_from_map(class_id: int) -> Dict[str, Optional[str]]:
+    key = str(class_id)
+    info = SPECIES_MAP.get(key, {})
+    return {
+        "scientific_name": info.get("scientific_name"),
+        "korean_name": info.get("korean_name"),
+        "common_name": info.get("common_name"),
     }
 
-    if not results or len(results) == 0:
-        return out
 
-    r0 = results[0]
-    if r0.boxes is None or len(r0.boxes) == 0:
-        return out
+# -----------------------------------------------------------------------------
+# Load model once (server startup)
+# -----------------------------------------------------------------------------
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"YOLO model not found: {MODEL_PATH}. "
+        f"Put best.pt at repo root or set YOLO_MODEL_PATH env."
+    )
 
-    xyxy = r0.boxes.xyxy.cpu().numpy()
-    conf = r0.boxes.conf.cpu().numpy()
-    cls = r0.boxes.cls.cpu().numpy().astype(int)
+model = YOLO(MODEL_PATH)
 
-    # ✅ top-1
-    best_idx = int(conf.argmax())
-    best_class_id = int(cls[best_idx])
-    best_species = SPECIES_MAP.get(best_class_id, f"unknown_{best_class_id}")
-    out["top_species"] = best_species
-    out["top_confidence"] = float(conf[best_idx])
-
-    # ✅ all detections + species counts
-    for i in range(len(xyxy)):
-        x1, y1, x2, y2 = xyxy[i].tolist()
-        confidence = float(conf[i])
-        class_id = int(cls[i])
-
-        species = SPECIES_MAP.get(class_id, f"unknown_{class_id}")
-
-        out["species_counts"][species] = out["species_counts"].get(species, 0) + 1
-
-        out["detections"].append(
-            {
-                "species": species,
-                "confidence": confidence,
-                "bbox_xyxy": [x1, y1, x2, y2],
-            }
-        )
-
-    return out
+# -----------------------------------------------------------------------------
+# MCP Server
+# -----------------------------------------------------------------------------
+mcp = FastMCP("yolo11-species-mcp")
 
 
-# --------------------------------------------
-# ✅ MCP Tool: YOLO11 추론
-# --------------------------------------------
-@mcp.tool
-def yolo11_predict(
-    image_b64: Optional[str] = None,
+@mcp.tool()
+def classify_species(
+    image_base64: Optional[str] = None,
     image_url: Optional[str] = None,
-    conf: float = CONF_DEFAULT,
-    iou: float = IOU_DEFAULT,
-    max_det: int = 300,
-    imgsz: int = 640,
+    image_path: Optional[str] = None,
+    top_k: int = 1,
 ) -> Dict[str, Any]:
     """
-    입력(둘 중 하나 필수):
-      - image_b64: base64 인코딩 이미지 문자열
-      - image_url: 이미지 URL
+    YOLO11(best.pt) 기반 종 판별.
+    - ChatGPT 추론/보정 없이 YOLO 결과(confidence) 기반으로 반환.
+    - image_base64 / image_url / image_path 중 하나를 제공해야 함.
 
-    출력(JSON-only):
-      - source, nonce, top_species, top_confidence, species_counts, detections
+    Returns:
+      {
+        "ok": bool,
+        "model_path": str,
+        "top_k": int,
+        "detections": [
+          {
+            "rank": int,
+            "class_id": int,
+            "confidence": float,
+            "bbox_xyxy": [x1,y1,x2,y2],
+            "scientific_name": str | null,
+            "korean_name": str | null,
+            "common_name": str | null
+          }, ...
+        ],
+        "best": {...} | null,
+        "notes": str
+      }
     """
-
-    # ✅ 서버 로그로 "도구가 실제 호출되는지" 즉시 확인
-    print(
-        "[CALL] yolo11_predict",
-        {
-            "has_b64": bool(image_b64),
-            "has_url": bool(image_url),
-            "conf": conf,
-            "iou": iou,
-            "imgsz": imgsz,
-            "max_det": max_det,
-            "device": DEVICE,
-        },
-    )
-
-    if not image_b64 and not image_url:
+    # --------------------------
+    # Validate input
+    # --------------------------
+    provided = [image_base64 is not None, image_url is not None, image_path is not None]
+    if sum(provided) != 1:
         return {
-            "source": "yolo11_mcp",
-            "nonce": str(uuid.uuid4()),
-            "weights": WEIGHTS_ABS,
-            "device": DEVICE,
-            "top_species": None,
-            "top_confidence": None,
-            "species_counts": {},
+            "ok": False,
+            "model_path": MODEL_PATH,
+            "top_k": top_k,
             "detections": [],
-            "error": "image_b64 또는 image_url 중 하나는 반드시 필요합니다.",
+            "best": None,
+            "notes": "Provide exactly one of image_base64, image_url, image_path."
         }
 
-    tmp_path: Optional[str] = None
-
+    # --------------------------
+    # Load image
+    # --------------------------
     try:
-        if image_b64:
-            tmp_path = _save_base64_to_tempfile(image_b64)
+        if image_base64 is not None:
+            pil = _pil_from_base64(image_base64)
+        elif image_url is not None:
+            pil = _pil_from_url(image_url)
         else:
-            tmp_path = _download_url_to_tempfile(image_url)  # type: ignore[arg-type]
-
-        results = model.predict(
-            source=tmp_path,
-            conf=conf,
-            iou=iou,
-            imgsz=imgsz,
-            max_det=max_det,
-            device=DEVICE,
-            verbose=False,
-        )
-
-        return _results_to_json(results)
-
+            pil = _pil_from_path(image_path)  # type: ignore[arg-type]
     except Exception as e:
         return {
-            "source": "yolo11_mcp",
-            "nonce": str(uuid.uuid4()),
-            "weights": WEIGHTS_ABS,
-            "device": DEVICE,
-            "top_species": None,
-            "top_confidence": None,
-            "species_counts": {},
+            "ok": False,
+            "model_path": MODEL_PATH,
+            "top_k": top_k,
             "detections": [],
-            "error": str(e),
+            "best": None,
+            "notes": f"Failed to load image: {e}"
         }
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+    img_np = _image_to_numpy_rgb(pil)
+
+    # --------------------------
+    # YOLO inference
+    # --------------------------
+    # ultralytics YOLO: results = model.predict(source, conf=..., iou=..., verbose=False)
+    try:
+        results = model.predict(
+            img_np,
+            conf=CONF_THRES,
+            iou=IOU_THRES,
+            verbose=False
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "model_path": MODEL_PATH,
+            "top_k": top_k,
+            "detections": [],
+            "best": None,
+            "notes": f"YOLO inference failed: {e}"
+        }
+
+    if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+        return {
+            "ok": True,
+            "model_path": MODEL_PATH,
+            "top_k": top_k,
+            "detections": [],
+            "best": None,
+            "notes": "No detections above threshold."
+        }
+
+    boxes = results[0].boxes
+    # boxes.conf, boxes.cls, boxes.xyxy
+    confs = boxes.conf.detach().cpu().numpy()
+    clss = boxes.cls.detach().cpu().numpy().astype(int)
+    xyxys = boxes.xyxy.detach().cpu().numpy()
+
+    # --------------------------
+    # Sort by confidence desc
+    # --------------------------
+    order = np.argsort(-confs)
+    top_k = max(1, int(top_k))
+    order = order[:top_k]
+
+    detections: List[Dict[str, Any]] = []
+    for rank, idx in enumerate(order, start=1):
+        class_id = int(clss[idx])
+        confidence = float(confs[idx])
+        bbox_xyxy = _xyxy_to_list(xyxys[idx])
+
+        name_info = _class_name_from_map(class_id)
+
+        detections.append({
+            "rank": rank,
+            "class_id": class_id,
+            "confidence": confidence,
+            "bbox_xyxy": bbox_xyxy,
+            **name_info
+        })
+
+    best = detections[0] if detections else None
+
+    # NOTE: 여기서 “LLM이 보정해서 바꾸지 않도록”
+    #       결과는 YOLO 출력 기반으로만 작성 (추가 추론/재해석 X)
+    return {
+        "ok": True,
+        "model_path": MODEL_PATH,
+        "top_k": top_k,
+        "detections": detections,
+        "best": best,
+        "notes": "Returned strictly based on YOLO11 predictions (no LLM override)."
+    }
 
 
-# --------------------------------------------
-# 서버 실행
-# --------------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8001))
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=port,
-        path="/mcp",
-    )
+    # FastMCP 서버 실행
+    # 실행: python server.py
+    mcp.run()
